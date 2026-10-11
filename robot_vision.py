@@ -4,6 +4,7 @@ import socket
 import time
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from ultralytics import YOLO
@@ -27,8 +28,9 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # "serial" -> USB cable to the ESP32 (needs: pip install pyserial)
 # "none"   -> vision only, nothing is sent
 ROBOT_LINK = "tcp"
-ROBOT_HOST = "robot.local"        # or the IP printed by the ESP32, e.g. "192.168.1.50"
+ROBOT_HOST = "auto"               # "auto" = scan the network; or a fixed IP / hostname
 ROBOT_PORT = 23
+NET_HINT_IP = "10.80.160.217"     # any IP on your network (the camera); used to find your subnet
 SERIAL_PORT = "COM5"
 SERIAL_BAUD = 115200
 
@@ -56,35 +58,106 @@ RED_C = (0, 0, 220)
 
 
 class RobotLink:
-    """Sends 'D,<R|B>,<dist>,<cx_err>' and 'H' lines to the ESP32 and prints its replies."""
+    """Non-blocking link. Connecting/scanning happens in a background thread.
+
+    Sends 'D,<R|B>,<dist>,<cx_err>' and 'H' lines to the ESP32 and prints its replies.
+    """
 
     def __init__(self):
         self.sock = None
         self.ser = None
         self.connected = False
+        self.connecting = False
         self.last_try = 0.0
+        self.last_ip = None
+        self.status = "idle"
 
+    # ---------- connection (runs in background thread) ----------
     def _connect(self):
-        if ROBOT_LINK == "none" or time.time() - self.last_try < 2.0:
+        if ROBOT_LINK == "none" or self.connecting or time.time() - self.last_try < 2.0:
             return
         self.last_try = time.time()
+        self.connecting = True
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    @staticmethod
+    def _probe(host, need_banner=True):
+        """Return an open socket if host:ROBOT_PORT is the robot, else None."""
+        try:
+            s = socket.create_connection((host, ROBOT_PORT), timeout=0.6)
+            s.settimeout(1.0)
+            if need_banner:
+                data = s.recv(128)
+                if b"vision link" not in data:
+                    s.close()
+                    return None
+            return s
+        except Exception:
+            return None
+
+    def _scan_subnet(self):
+        try:
+            t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            t.connect((NET_HINT_IP, 80))
+            my_ip = t.getsockname()[0]
+            t.close()
+        except Exception:
+            return None
+        base = ".".join(my_ip.split(".")[:3])
+        hosts = [f"{base}.{i}" for i in range(1, 255) if f"{base}.{i}" != my_ip]
+        found = None
+        with ThreadPoolExecutor(max_workers=64) as ex:
+            futs = {ex.submit(self._probe, h): h for h in hosts}
+            for f in as_completed(futs):
+                s = f.result()
+                if s is not None and found is None:
+                    found = (futs[f], s)
+                elif s is not None:
+                    s.close()
+        return found
+
+    def _connect_worker(self):
         try:
             if ROBOT_LINK == "tcp":
-                s = socket.create_connection((ROBOT_HOST, ROBOT_PORT), timeout=3)
+                self.status = "searching"
+                found = None
+                # 1) last known IP, 2) fixed host, 3) subnet scan
+                candidates = []
+                if self.last_ip:
+                    candidates.append(self.last_ip)
+                if ROBOT_HOST != "auto":
+                    candidates.append(ROBOT_HOST)
+                for h in candidates:
+                    s = self._probe(h, need_banner=False)
+                    if s:
+                        found = (h, s)
+                        break
+                if found is None:
+                    found = self._scan_subnet()
+                if found is None:
+                    raise RuntimeError("robot not found on network (is it on WiFi?)")
+                host, s = found
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.settimeout(None)
                 self.sock = s
+                self.last_ip = host
                 threading.Thread(target=self._read_tcp, args=(s,), daemon=True).start()
+                print(f"\n[link] robot found at {host}")
             else:
                 import serial
                 self.ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.2)
                 threading.Thread(target=self._read_serial, args=(self.ser,), daemon=True).start()
+                print(f"\n[link] connected (serial {SERIAL_PORT})")
             self.connected = True
-            print(f"\n[link] connected ({ROBOT_LINK})")
+            self.status = "ok"
         except Exception as e:
             self.connected = False
-            print(f"\n[link] connect failed: {e}")
+            self.status = "down"
+            print(f"\n[link] {e}")
+        finally:
+            self.connecting = False
 
+    # ---------- readers ----------
     def _read_tcp(self, s):
         buf = b""
         try:
@@ -125,8 +198,7 @@ class RobotLink:
         if ROBOT_LINK == "none":
             return
         if not self.connected:
-            self._connect()
-        if not self.connected:
+            self._connect()      # returns immediately (work is done in a thread)
             return
         data = (line + "\n").encode()
         try:
@@ -335,7 +407,14 @@ try:
                        f"{key}: {dist:.1f} cm (target {REFERENCE[key]['dist_cm']:.0f} cm) - {status}",
                        10, 70, color)
 
-        link_txt = "LINK: OK" if link.connected else ("LINK: OFF" if ROBOT_LINK == "none" else "LINK: DOWN")
+        if link.connected:
+            link_txt = "LINK: OK"
+        elif ROBOT_LINK == "none":
+            link_txt = "LINK: OFF"
+        elif link.connecting:
+            link_txt = "LINK: SEARCHING..."
+        else:
+            link_txt = "LINK: DOWN"
         draw_label(display, link_txt, 10, 110, GREEN if link.connected else RED_C)
 
         cv2.imshow("Low-Latency IP Camera Detection", display)
